@@ -61,6 +61,19 @@ st.set_page_config(
 
 SAMPLE_DIR = Path(__file__).parent / "data" / "sample"
 
+# Per-sample-dataset preferred column assignments (override auto-detection)
+SAMPLE_COLUMN_DEFAULTS: dict[str, dict[str, str | list[str] | None]] = {
+    "synthetic_omnichannel.csv": {
+        "customer_id": "customer_id",
+        "time_period": "week",
+        "treatment_binary": None,
+        "treatment_continuous": "tv_streaming_impressions",
+        "outcome": "units_sold",
+        "geographic_id": "zip_code",
+        "covariates": ["prior_spend", "region"],
+    },
+}
+
 # ---------------------------------------------------------------------------
 # Session state defaults
 # ---------------------------------------------------------------------------
@@ -148,6 +161,7 @@ st.sidebar.header("1. Upload Data")
 upload_mode = st.sidebar.radio(
     "Data source",
     ["Upload CSV", "Use sample data"],
+    index=1,
     horizontal=True,
     label_visibility="collapsed",
 )
@@ -213,6 +227,27 @@ columns = [c for c in df.columns if c not in _INTERNAL_COLS]
 detections = detect_columns(df[columns])
 none_option = ["(none)"]
 
+# Apply sample-specific overrides if available
+_source = st.session_state.get("_data_source", "")
+_sample_name = _source.split(":", 1)[1] if _source and _source.startswith("sample:") else None
+_sample_overrides = SAMPLE_COLUMN_DEFAULTS.get(_sample_name, {}) if _sample_name else {}
+
+
+def _effective_default(role: str) -> str | None:
+    """Return the effective default column name for a role.
+
+    Uses sample-specific overrides first, then falls back to auto-detection.
+    """
+    if role in _sample_overrides:
+        return _sample_overrides[role]
+    det = detections.get(role)
+    if det is None:
+        return None
+    if isinstance(det, list):
+        return [s.column_name for s in det]
+    return det.column_name
+
+
 # Helper for building dropdown defaults
 def _default_index(col_name: str | None, options: list[str]) -> int:
     if col_name and col_name in options:
@@ -222,8 +257,7 @@ def _default_index(col_name: str | None, options: list[str]) -> int:
 
 # Customer ID
 cid_options = none_option + columns
-cid_default = detections.get("customer_id")
-cid_default_name = cid_default.column_name if cid_default else None
+cid_default_name = _effective_default("customer_id")
 customer_id_col = st.sidebar.selectbox(
     "Customer ID",
     cid_options,
@@ -236,8 +270,7 @@ if customer_id_col == "(none)":
 
 # Time period
 time_options = none_option + columns
-time_default = detections.get("time_period")
-time_default_name = time_default.column_name if time_default else None
+time_default_name = _effective_default("time_period")
 time_col = st.sidebar.selectbox(
     "Time Period",
     time_options,
@@ -250,8 +283,7 @@ if time_col == "(none)":
 
 # Treatment (binary)
 treat_b_options = none_option + columns
-treat_b_default = detections.get("treatment_binary")
-treat_b_default_name = treat_b_default.column_name if treat_b_default else None
+treat_b_default_name = _effective_default("treatment_binary")
 treatment_binary_col = st.sidebar.selectbox(
     "Treatment (binary)",
     treat_b_options,
@@ -264,8 +296,7 @@ if treatment_binary_col == "(none)":
 
 # Treatment (continuous) — for threshold module
 treat_c_options = none_option + columns
-treat_c_default = detections.get("treatment_continuous")
-treat_c_default_name = treat_c_default.column_name if treat_c_default else None
+treat_c_default_name = _effective_default("treatment_continuous")
 treatment_continuous_col = st.sidebar.selectbox(
     "Treatment (continuous)",
     treat_c_options,
@@ -278,8 +309,7 @@ if treatment_continuous_col == "(none)":
 
 # Outcome
 outcome_options = none_option + columns
-outcome_default = detections.get("outcome")
-outcome_default_name = outcome_default.column_name if outcome_default else None
+outcome_default_name = _effective_default("outcome")
 outcome_col = st.sidebar.selectbox(
     "Outcome Variable",
     outcome_options,
@@ -292,8 +322,7 @@ if outcome_col == "(none)":
 
 # ZIP code
 zip_options = none_option + columns
-zip_default = detections.get("geographic_id")
-zip_default_name = zip_default.column_name if zip_default else None
+zip_default_name = _effective_default("geographic_id")
 zip_col = st.sidebar.selectbox(
     "ZIP Code",
     zip_options,
@@ -312,15 +341,19 @@ assigned_cols = {
 }
 available_covariates = [c for c in columns if c not in assigned_cols]
 
-# Auto-detect defaults
-cov_defaults_detected = detections.get("covariates", [])
-if isinstance(cov_defaults_detected, list):
-    cov_default_names = [
-        s.column_name for s in cov_defaults_detected
-        if s.column_name in available_covariates
-    ]
+# Covariate defaults: sample overrides or auto-detected
+_cov_override = _sample_overrides.get("covariates")
+if _cov_override is not None:
+    cov_default_names = [c for c in _cov_override if c in available_covariates]
 else:
-    cov_default_names = []
+    cov_defaults_detected = detections.get("covariates", [])
+    if isinstance(cov_defaults_detected, list):
+        cov_default_names = [
+            s.column_name for s in cov_defaults_detected
+            if s.column_name in available_covariates
+        ]
+    else:
+        cov_default_names = []
 
 covariate_cols = st.sidebar.multiselect(
     "Covariates",
