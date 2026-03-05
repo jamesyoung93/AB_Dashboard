@@ -371,8 +371,252 @@ def generate_scm(rng: np.random.Generator) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def generate_campaigns(rng: np.random.Generator) -> pd.DataFrame:
+    """Generate multi-campaign dataset with known per-campaign ATTs.
+
+    Simulates a realistic media-mix scenario where 15 campaigns across
+    5 channels (TV, Email, Social, Direct Mail, Field Rep) run over a
+    20-week panel.  Each campaign has a distinct causal effect on revenue,
+    ranging from strongly positive to null to negative.
+
+    DGP:
+        revenue = 50 + sum(campaign_att_i * exposed_i * post)
+                  + covariates + epsilon(N(0, 8))
+
+    Known ATTs (revenue, post-period only):
+        TV:
+            tv_30s_brand .............. +0.5  (weak brand lift)
+            tv_45s_product ............ +2.5  (strong product focus)
+            tv_60s_testimonial ........ +3.5  (strongest — long-form trust)
+            tv_15s_reminder ........... +0.2  (negligible digital pre-roll)
+        Email:
+            email_personalized ........ +2.0  (personalized subject line)
+            email_generic ............. +0.3  (generic newsletter, weak)
+            email_promo ............... +1.5  (promotional / discount CTA)
+        Social:
+            social_retargeting ........ +2.5  (high intent, retargeted)
+            social_brand_awareness .... +0.5  (broad reach, low intent)
+            social_ugc ................ -0.8  (negative — cannibalizes organic)
+        Direct Mail:
+            dm_catalog ................ +1.2  (full product catalog)
+            dm_postcard ............... +0.0  (null — no effect)
+            dm_letter ................. +1.8  (personalized letter)
+        Field Rep:
+            rep_product_demo .......... +4.0  (strongest overall — in-person)
+            rep_followup_call ......... +1.0  (phone follow-up)
+
+    Confounding structure:
+        - High-value customers (Enterprise/Large, high prior_spend) are
+          more likely to receive rep_product_demo, email_personalized,
+          and dm_letter (targeting bias).
+        - Tech/Finance customers are more likely to see social_retargeting
+          and tv_45s_product (industry targeting).
+        - Brand campaigns (tv_30s_brand, social_brand_awareness) have
+          near-random assignment (low confounding).
+        - Promo campaigns target customers with lower engagement_score
+          (win-back strategy).
+    """
+    n_customers = 300
+    n_weeks = 20
+    pre_periods = 10
+
+    # --- Campaign definitions: (name, true_att, assignment_fn) ---
+    # Assignment functions return P(exposed) per customer given their
+    # characteristics.  They are called once and the exposure is held
+    # constant across all weeks (customer-level assignment, like the
+    # original channel_email design).
+
+    beta_0 = 50.0
+    sigma_epsilon = 8.0
+
+    gamma_company = {"Small": 0.0, "Medium": 3.0, "Large": 8.0, "Enterprise": 15.0}
+    gamma_industry = {
+        "Technology": 5.0, "Finance": 3.0, "Healthcare": 2.0,
+        "Manufacturing": 0.0, "Other": -2.0,
+    }
+    gamma_prior_spend = 0.02
+    gamma_engagement = 0.1
+
+    # Assign ZIP codes
+    all_zips = []
+    zip_regions = {}
+    for region, zips in SAMPLE_ZIPS.items():
+        n_select = min(50, len(zips))
+        selected = rng.choice(zips, size=n_select, replace=False)
+        all_zips.extend(selected)
+        for z in selected:
+            zip_regions[z] = region
+    all_zips = np.array(all_zips)
+
+    # Customer-level attributes
+    company_sizes = rng.choice(
+        ["Small", "Medium", "Large", "Enterprise"],
+        size=n_customers, p=[0.30, 0.30, 0.25, 0.15],
+    )
+    industries = rng.choice(
+        ["Technology", "Finance", "Healthcare", "Manufacturing", "Other"],
+        size=n_customers, p=[0.25, 0.20, 0.20, 0.20, 0.15],
+    )
+    prior_spend = np.clip(rng.normal(500, 150, n_customers), 50, None)
+    tenure_years = rng.uniform(0.5, 15, n_customers)
+    engagement_score = np.clip(rng.normal(50, 15, n_customers), 0, 100)
+    customer_zips = rng.choice(all_zips, size=n_customers)
+    customer_regions = np.array([zip_regions[z] for z in customer_zips])
+
+    # Helper arrays for propensity computation
+    is_enterprise = (company_sizes == "Enterprise").astype(float)
+    is_large = (company_sizes == "Large").astype(float)
+    is_medium = (company_sizes == "Medium").astype(float)
+    is_tech = (industries == "Technology").astype(float)
+    is_finance = (industries == "Finance").astype(float)
+    spend_z = (prior_spend - 500) / 150  # standardized
+    engage_z = (engagement_score - 50) / 15
+
+    def _assign(logit: np.ndarray) -> np.ndarray:
+        """Bernoulli draw from logistic of *logit*."""
+        p = 1 / (1 + np.exp(-logit))
+        return (rng.uniform(size=n_customers) < p).astype(int)
+
+    # --- Campaign assignment (customer-level, time-invariant) ---
+    campaigns: dict[str, tuple[float, np.ndarray]] = {}
+
+    # TV campaigns
+    # 30s brand: broad reach, near-random (low confounding)
+    campaigns["tv_30s_brand"] = (
+        0.5,
+        _assign(-0.4 + 0.1 * spend_z),  # ~40%, near-random
+    )
+    # 45s product: tech/finance targeted
+    campaigns["tv_45s_product"] = (
+        2.5,
+        _assign(-0.8 + 0.6 * is_tech + 0.4 * is_finance + 0.2 * spend_z),
+    )
+    # 60s testimonial: targets higher-value customers
+    campaigns["tv_60s_testimonial"] = (
+        3.5,
+        _assign(-1.2 + 0.5 * is_enterprise + 0.4 * is_large + 0.3 * spend_z),
+    )
+    # 15s reminder: very broad, nearly random
+    campaigns["tv_15s_reminder"] = (
+        0.2,
+        _assign(-0.2 + 0.05 * engage_z),  # ~45%, near-random
+    )
+
+    # Email campaigns
+    # Personalized: targets high-value, high-engagement
+    campaigns["email_personalized"] = (
+        2.0,
+        _assign(-1.0 + 0.5 * is_enterprise + 0.4 * is_large
+                + 0.3 * engage_z + 0.2 * spend_z),
+    )
+    # Generic: broad newsletter, near-random
+    campaigns["email_generic"] = (
+        0.3,
+        _assign(-0.3 + 0.1 * engage_z),  # ~42%
+    )
+    # Promo: win-back — targets LOW engagement (reverse confounding)
+    campaigns["email_promo"] = (
+        1.5,
+        _assign(-0.5 - 0.4 * engage_z + 0.2 * spend_z),
+    )
+
+    # Social campaigns
+    # Retargeting: tech/finance + high engagement
+    campaigns["social_retargeting"] = (
+        2.5,
+        _assign(-1.0 + 0.5 * is_tech + 0.3 * is_finance + 0.3 * engage_z),
+    )
+    # Brand awareness: broad, near-random
+    campaigns["social_brand_awareness"] = (
+        0.5,
+        _assign(-0.4 + 0.1 * is_tech),  # ~40%
+    )
+    # UGC: cannibalizes organic — high-engagement customers targeted
+    campaigns["social_ugc"] = (
+        -0.8,
+        _assign(-0.8 + 0.4 * engage_z + 0.2 * is_tech),
+    )
+
+    # Direct Mail
+    # Catalog: medium targeting
+    campaigns["dm_catalog"] = (
+        1.2,
+        _assign(-0.6 + 0.3 * is_large + 0.2 * is_enterprise + 0.1 * spend_z),
+    )
+    # Postcard: near-random, null effect
+    campaigns["dm_postcard"] = (
+        0.0,
+        _assign(-0.3 + 0.05 * engage_z),  # ~43%
+    )
+    # Letter: high-value targeting
+    campaigns["dm_letter"] = (
+        1.8,
+        _assign(-1.3 + 0.6 * is_enterprise + 0.5 * is_large + 0.3 * spend_z),
+    )
+
+    # Field Rep
+    # Product demo: very strong targeting to Enterprise/Large
+    campaigns["rep_product_demo"] = (
+        4.0,
+        _assign(-2.0 + 1.2 * is_enterprise + 0.8 * is_large + 0.3 * spend_z),
+    )
+    # Follow-up call: moderate targeting
+    campaigns["rep_followup_call"] = (
+        1.0,
+        _assign(-0.7 + 0.4 * is_enterprise + 0.3 * is_large + 0.2 * engage_z),
+    )
+
+    # --- Build panel ---
+    rows = []
+    for i in range(n_customers):
+        for w in range(1, n_weeks + 1):
+            post = int(w > pre_periods)
+
+            # Revenue DGP: baseline + covariate effects + campaign effects
+            revenue = (
+                beta_0
+                + gamma_company[company_sizes[i]]
+                + gamma_industry[industries[i]]
+                + gamma_prior_spend * prior_spend[i]
+                + gamma_engagement * engagement_score[i]
+                + 2.0 * post  # common time trend
+            )
+
+            # Add each campaign's causal effect (only in post-period)
+            for cname, (att, assignment) in campaigns.items():
+                revenue += att * assignment[i] * post
+
+            # Noise
+            revenue += rng.normal(0, sigma_epsilon)
+
+            # Units sold (correlated outcome)
+            units = 10 + 0.12 * revenue + rng.normal(0, 3)
+
+            row = {
+                "customer_id": i + 1,
+                "zip_code": customer_zips[i],
+                "week": w,
+                "revenue": round(revenue, 2),
+                "units_sold": round(max(0, units), 2),
+                "prior_spend": round(prior_spend[i], 2),
+                "tenure_years": round(tenure_years[i], 2),
+                "company_size": company_sizes[i],
+                "industry": industries[i],
+                "engagement_score": round(engagement_score[i], 2),
+                "region": customer_regions[i],
+            }
+
+            # Add campaign exposure columns
+            for cname, (att, assignment) in campaigns.items():
+                row[cname] = assignment[i]
+
+            rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
 def main() -> None:
-    """Generate all three synthetic datasets."""
+    """Generate all four synthetic datasets."""
     rng = np.random.default_rng(SEED)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -382,6 +626,16 @@ def main() -> None:
     print(f"  {len(df_omni)} rows x {len(df_omni.columns)} cols")
     print(f"  Treated (email): {df_omni['channel_email'].mean():.1%}")
     print(f"  Weeks: {df_omni['week'].nunique()}")
+
+    print("\nGenerating synthetic_campaigns.csv ...")
+    df_campaigns = generate_campaigns(rng)
+    df_campaigns.to_csv(OUTPUT_DIR / "synthetic_campaigns.csv", index=False)
+    n_camp_cols = [c for c in df_campaigns.columns if c.startswith(("tv_", "email_", "social_", "dm_", "rep_"))]
+    print(f"  {len(df_campaigns)} rows x {len(df_campaigns.columns)} cols")
+    print(f"  Campaigns: {len(n_camp_cols)}")
+    for c in n_camp_cols:
+        pct = df_campaigns[c].mean()
+        print(f"    {c}: {pct:.1%} exposed")
 
     print("\nGenerating synthetic_rdd.csv ...")
     df_rdd = generate_rdd(rng)
